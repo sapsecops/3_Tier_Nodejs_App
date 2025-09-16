@@ -51,7 +51,7 @@ DB_HOST=<DB-Private-IP>
 DB_USER=appuser
 DB_PASSWORD=Aditya
 DB_NAME=crud_app
-JWT_SECRET=digistackSuperSecretKey
+JWT_SECRET=sapsecopsSuperSecretKey
 ```
 
 ## Install Dependencies
