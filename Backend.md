@@ -63,7 +63,7 @@ npm install
 ```
 npm start
 ```
-HERE it is not recommend in Production, so we follow the HA in Production
+HERE it is recommend in Production, so we follow the HA in Production
 
 Start Backend Application
 ```
