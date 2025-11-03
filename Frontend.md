@@ -36,7 +36,8 @@ Switch branch
 git checkout 01-Local-setup
 sudo chown -R ec2-user:ec2-user /home/ec2-user/3_Tier_Nodejs_App
 ```
-Note => Nginx we we for 2 purpose 
+Note => HERE we use Nginx for 2 purpose
+
         (1) For Frontend Load Balancing 
         (2) For Backend Reverse Proxy
 
