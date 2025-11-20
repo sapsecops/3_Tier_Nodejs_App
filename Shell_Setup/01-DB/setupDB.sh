@@ -1,217 +1,134 @@
 #!/usr/bin/env bash
-# setup-mysql-el9.sh
-# Idempotent installer/configurer for MySQL 8 on EL9 (dnf).
-#
-# - installs mysql-community-server & client
-# - ensures bind-address = 0.0.0.0 in /etc/my.cnf
-# - starts/enables mysqld
-# - sets root password (using temporary password if present)
-# - runs basic secure steps (remove anonymous user, drop test db)
-# - creates dbadmin@'%' with ALL privileges (idempotent)
-#
-# EDIT the variables below before running or export them in the environment.
-#
-# WARNING: Storing passwords in a script is insecure. Use secrets manager in production.
+# setup-mysql-el9-fixed.sh
+# Fixed idempotent installer for MySQL 8 on EL9 (dnf).
+# Use: sudo bash setup-mysql-el9-fixed.sh
 
 set -euo pipefail
 IFS=$'\n\t'
 
-# ----------------- CONFIG -----------------
-ROOT_PW="${ROOT_PW:-VenkY@007}"        # new root password to set (change before running)
+# -------- CONFIG: edit or export before running ----------
+ROOT_PW="${ROOT_PW:-VenkY@007}"
 DBADMIN_USER="${DBADMIN_USER:-dbadmin}"
 DBADMIN_PW="${DBADMIN_PW:-Admin@123}"
 MYSQL_REPO_RPM="mysql80-community-release-el9-1.noarch.rpm"
 MYSQL_REPO_URL="https://dev.mysql.com/get/${MYSQL_REPO_RPM}"
 MYSQL_GPG_KEY_URL="https://repo.mysql.com/RPM-GPG-KEY-mysql-2023"
 BIND_ADDR="0.0.0.0"
-
-# ----------------- END CONFIG -----------------
+TMP_DIR="/tmp"
+RPM_PATH="${TMP_DIR}/${MYSQL_REPO_RPM}"
+# --------------------------------------------------------
 
 log(){ echo "==> $*"; }
 err(){ echo "ERROR: $*" >&2; exit 1; }
 
 if [[ $EUID -ne 0 ]]; then
-  echo "This script requires root. Run with sudo." >&2
-  exit 1
+  err "Please run with sudo or as root: sudo bash $0"
 fi
 
-log "1) Installing MySQL repo rpm & packages (if needed)"
-
-cd /tmp
-if ! rpm -q mysql-community-server >/dev/null 2>&1; then
-  if [[ ! -f "${MYSQL_REPO_RPM}" ]]; then
-    log "Downloading ${MYSQL_REPO_RPM}"
-    curl -sS -O "${MYSQL_REPO_URL}"
-  else
-    log "${MYSQL_REPO_RPM} already present in /tmp"
-  fi
-
-  log "Installing repo package ${MYSQL_REPO_RPM}"
-  dnf install -y "${MYSQL_REPO_RPM}"
-
-  log "Importing MySQL GPG key"
-  rpm --import "${MYSQL_GPG_KEY_URL}" || true
-else
-  log "mysql-community-server already installed (package present)"
+log "Ensuring curl is present"
+if ! command -v curl >/dev/null 2>&1; then
+  dnf install -y curl
 fi
 
-# Install client & server packages idempotently
-if ! rpm -q mysql-community-client >/dev/null 2>&1; then
-  log "Installing mysql-community-client"
-  dnf install -y mysql-community-client
-else
-  log "mysql-community-client already installed"
+log "Downloading repo RPM to ${RPM_PATH} (will re-download if missing or size suspicious)"
+# download with -f (fail on http error) and -L (follow redirects)
+curl -fL --retry 3 --retry-delay 2 -o "${RPM_PATH}.partial" "${MYSQL_REPO_URL}" || {
+  rm -f "${RPM_PATH}.partial"
+  err "Failed to download ${MYSQL_REPO_URL}. Check network or URL."
+}
+mv -f "${RPM_PATH}.partial" "${RPM_PATH}"
+chmod 0644 "${RPM_PATH}"
+
+# quick sanity check: file size > 4 KB
+if [[ ! -s "${RPM_PATH}" || $(stat -c%s "${RPM_PATH}") -lt 4096 ]]; then
+  err "Downloaded RPM looks too small or empty: ${RPM_PATH}"
 fi
 
-if ! rpm -q mysql-community-server >/dev/null 2>&1; then
-  log "Installing mysql-community-server"
-  dnf install -y mysql-community-server
-else
-  log "mysql-community-server already installed"
-fi
+log "Importing GPG key"
+rpm --import "${MYSQL_GPG_KEY_URL}" || log "Warning: rpm --import failed (maybe already imported)."
 
-log "2) Starting and enabling mysqld service"
+log "Installing repo rpm package from absolute path: ${RPM_PATH}"
+dnf install -y "${RPM_PATH}"
+
+log "Installing mysql client & server packages"
+dnf install -y mysql-community-client mysql-community-server
+
+log "Starting & enabling mysqld"
 systemctl daemon-reload || true
 systemctl start mysqld
 systemctl enable mysqld
-systemctl is-active --quiet mysqld && log "mysqld is active" || err "mysqld failed to start; check 'journalctl -u mysqld'"
+if ! systemctl is-active --quiet mysqld; then
+  journalctl -u mysqld -n 50 --no-pager
+  err "mysqld did not start successfully; check journalctl output above."
+fi
 
-log "3) Ensure bind-address = ${BIND_ADDR} in /etc/my.cnf (backup will be created)"
+log "Configuring bind-address in /etc/my.cnf (backup made)"
 MYCNF="/etc/my.cnf"
-if [[ ! -f "${MYCNF}" ]]; then
-  err "${MYCNF} not found"
-fi
-
-cp -a "${MYCNF}" "${MYCNF}.bak.$(date +%s)"
-# Put bind-address under [mysqld] section (idempotent)
-if grep -Pzoq "(?s)\\[mysqld\\].*?bind-address\\s*=.*" "${MYCNF}"; then
-  # replace existing bind-address value in [mysqld]
-  awk -v addr="${BIND_ADDR}" '
-    BEGIN{inmysqld=0}
-    /^\[mysqld\]/{inmysqld=1; print; next}
-    /^\[/{inmysqld=0; print; next}
-    {
-      if(inmysqld && $1=="bind-address") {
-        print "bind-address = " addr
-      } else {
-        print
-      }
-    }' "${MYCNF}.bak.$(date +%s)" > "${MYCNF}.tmp" || true
-  # but awk approach above used a snapshot file; simpler replace using sed if earlier didn't work
-fi
-
-# Simpler idempotent approach: add or replace bind-address in [mysqld]
-# Remove any existing bind-address lines
-awk '
-  BEGIN{inmysqld=0}
-  /^\[mysqld\]/{inmysqld=1; print; next}
-  /^\[/{inmysqld=0; print; next}
-  {
-    if(inmysqld && $1=="bind-address") {
-      # skip old bind-address
-      next
-    } else {
-      print
-    }
-  }' "${MYCNF}" > "${MYCNF}.nobind"
-# Now insert bind-address after [mysqld] header (if not present)
-if grep -q "^\[mysqld\]" "${MYCNF}.nobind"; then
-  awk -v addr="${BIND_ADDR}" '
-    BEGIN{inserted=0}
-    /^\[mysqld\]/{print; print "bind-address = " addr; inserted=1; next}
-    {print}
-    END{ if(!inserted) print "[mysqld]\nbind-address = " addr }
-  ' "${MYCNF}.nobind" > "${MYCNF}.new"
-  mv "${MYCNF}.new" "${MYCNF}"
-  rm -f "${MYCNF}.nobind"
+if [[ -f "${MYCNF}" ]]; then
+  cp -a "${MYCNF}" "${MYCNF}.bak.$(date +%s)"
 else
-  # fallback: just append section
-  echo -e "\n[mysqld]\nbind-address = ${BIND_ADDR}" >> "${MYCNF}"
-  rm -f "${MYCNF}.nobind"
+  touch "${MYCNF}"
+  cp -a "${MYCNF}" "${MYCNF}.bak.$(date +%s)"
 fi
 
-log "Restarting mysqld to apply configuration change"
+# remove any existing bind-address in [mysqld] and add correct line
+awk -v addr="${BIND_ADDR}" '
+  BEGIN{inmysqld=0}
+  /^\[mysqld\]/{print; inmysqld=1; next}
+  /^\[/{ if(inmysqld){ print "bind-address = " addr; inmysqld=0 } print; next}
+  { if(inmysqld && $1=="bind-address") next; print }
+  END{ if(inmysqld){ print "bind-address = " addr } }
+' "${MYCNF}.bak.$(date +%s)" > "${MYCNF}.new" || true
+mv -f "${MYCNF}.new" "${MYCNF}"
+chmod 0644 "${MYCNF}"
+
+log "Restarting mysqld to apply bind-address"
 systemctl restart mysqld
 sleep 2
-systemctl is-active --quiet mysqld || {
+if ! systemctl is-active --quiet mysqld; then
   journalctl -u mysqld -n 80 --no-pager
   err "mysqld failed to restart after changing ${MYCNF}"
-}
+fi
 
-log "4) Retrieve temporary root password (if any) and set root password securely"
-
-# Grab latest temporary password line from log (if exists)
+# find temporary root password if present
 TMP_PW=""
-if sudo grep -i 'temporary password' /var/log/mysqld.log >/dev/null 2>&1; then
-  TMP_PW="$(sudo grep -i 'temporary password' /var/log/mysqld.log | tail -n1 | awk '{print $NF}')"
+if grep -i 'temporary password' /var/log/mysqld.log >/dev/null 2>&1; then
+  TMP_PW="$(grep -i 'temporary password' /var/log/mysqld.log | tail -n1 | awk '{print $NF}')"
   log "Detected temporary MySQL root password in /var/log/mysqld.log"
 fi
 
-# Helper to run mysql client; returns 0 if successful
-mysql_run() {
-  local args=("$@")
-  mysql "${args[@]}" -e "SELECT VERSION();" >/dev/null 2>&1
-}
-
-# If root can already login with desired ROOT_PW, skip
+# try to set root password
+log "Setting root password (non-interactive where possible)"
 if mysql -u root -p"${ROOT_PW}" -e "SELECT 1" >/dev/null 2>&1; then
-  log "Root already configured with the requested ROOT_PW (skipping root password set)."
+  log "Root already has the desired password; skipping password set."
 else
   if [[ -n "${TMP_PW}" ]]; then
-    log "Using temporary password to set the root password non-interactively"
-    # Use --connect-expired-password in case initial password is expired (common with MySQL 8)
-    mysql --connect-expired-password -u root -p"${TMP_PW}" -e "ALTER USER 'root'@'localhost' IDENTIFIED BY '${ROOT_PW}';" || {
-      log "Failed to alter root using temporary password — trying with unix_socket fallback"
-    }
+    log "Altering root using temporary password"
+    mysql --connect-expired-password -u root -p"${TMP_PW}" -e "ALTER USER 'root'@'localhost' IDENTIFIED BY '${ROOT_PW}';" || log "Failed to change root with temporary pw; continuing"
   else
-    log "No temporary password found. Attempting to set root password if login without password works (not typical)"
-    if mysql -u root -e "ALTER USER 'root'@'localhost' IDENTIFIED BY '${ROOT_PW}';" >/dev/null 2>&1; then
-      log "Set root password by connecting without password (successful)."
+    # try unix_socket login (some distros allow local socket)
+    if mysql -u root -e "SELECT 1" >/dev/null 2>&1; then
+      mysql -u root -e "ALTER USER 'root'@'localhost' IDENTIFIED BY '${ROOT_PW}';"
     else
-      err "Could not set root password: no temporary password found and root login without password failed. Please run 'sudo grep \"temporary password\" /var/log/mysqld.log' and set the root password manually."
+      log "No temporary pw and cannot connect as root without password. You may need to run 'sudo grep \"temporary password\" /var/log/mysqld.log' and set root password manually."
     fi
   fi
 fi
 
-log "5) Run basic secure steps (remove anonymous users, drop test DB, reload privileges). Will NOT change root remote access."
+# secure steps
+log "Running basic secure steps (remove anonymous, drop test database)"
+mysql -u root -p"${ROOT_PW}" -e "DELETE FROM mysql.user WHERE User='' OR User IS NULL; DROP DATABASE IF EXISTS test; DELETE FROM mysql.db WHERE Db='test' OR Db LIKE 'test\\_%'; FLUSH PRIVILEGES;" || log "Secure steps may have failed; check root credentials."
 
-# SQL to run idempotently
-SECURE_SQL=$(cat <<'SQL'
-DELETE FROM mysql.user WHERE User='' OR User IS NULL;
-DROP DATABASE IF EXISTS test;
-DELETE FROM mysql.db WHERE Db='test' OR Db='test\_%';
-FLUSH PRIVILEGES;
-SQL
-)
+# create dbadmin user
+log "Creating/altering ${DBADMIN_USER}@'%' and granting privileges"
+mysql -u root -p"${ROOT_PW}" -e "CREATE USER IF NOT EXISTS '${DBADMIN_USER}'@'%' IDENTIFIED BY '${DBADMIN_PW}'; ALTER USER '${DBADMIN_USER}'@'%' IDENTIFIED BY '${DBADMIN_PW}'; GRANT ALL PRIVILEGES ON *.* TO '${DBADMIN_USER}'@'%' WITH GRANT OPTION; FLUSH PRIVILEGES;" || err "Failed to create ${DBADMIN_USER}"
 
-# Execute secure SQL as root using the new root password
-mysql -u root -p"${ROOT_PW}" -e "${SECURE_SQL}"
-
-log "6) Create DB admin user '${DBADMIN_USER}'@'%' with ALL privileges (idempotent)"
-CREATE_SQL=$(cat <<SQL
--- create or alter user and grant privileges
-CREATE USER IF NOT EXISTS '${DBADMIN_USER}'@'%' IDENTIFIED BY '${DBADMIN_PW}';
-ALTER USER '${DBADMIN_USER}'@'%' IDENTIFIED BY '${DBADMIN_PW}';
-GRANT ALL PRIVILEGES ON *.* TO '${DBADMIN_USER}'@'%' WITH GRANT OPTION;
-FLUSH PRIVILEGES;
-SQL
-)
-mysql -u root -p"${ROOT_PW}" -e "${CREATE_SQL}"
-
-log "7) Final checks"
-log "MySQL version:"
+log "Final checks:"
 mysql -u root -p"${ROOT_PW}" -e "SELECT VERSION();" || true
+mysql -u root -p"${ROOT_PW}" -e "SELECT User,Host FROM mysql.user WHERE User IN ('root','${DBADMIN_USER}');" || true
 
-log "MySQL users (showing dbadmin and root):"
-mysql -u root -p"${ROOT_PW}" -e "SELECT User, Host FROM mysql.user WHERE User IN ('root','${DBADMIN_USER}');" || true
-
-log
-log "=== Completed MySQL setup ==="
-log "Notes:"
-log "- bind-address set to ${BIND_ADDR} in ${MYCNF}"
-log "- Root password set (please store it securely)."
-log "- dbadmin@'%' created with ALL privileges."
-log "- Open port 3306 in your Security Group to allow remote access, or better: restrict to specific CIDR(s)."
-log "- You originally mentioned SG port 27017 for MongoDB — ensure you open the correct DB port(s) as required."
-
+echo
+echo "=== Done ==="
+echo "- If you still get RPM open errors, remove /tmp/${MYSQL_REPO_RPM} and re-run the script to force fresh download."
+echo "- Run this script with: sudo bash setup-mysql-el9-fixed.sh"
 exit 0
