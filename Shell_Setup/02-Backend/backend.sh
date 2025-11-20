@@ -55,17 +55,17 @@ log "Starting deployment. Repo: ${REPO_URL}, branch: ${BRANCH}, app dir: ${API_D
 # ------------------ 1) Install git ------------------
 log "Installing git (if missing)..."
 if command -v dnf >/dev/null 2>&1; then
-  dnf install -y git
+  sudo dnf install -y git
 elif command -v yum >/dev/null 2>&1; then
-  yum install -y git
+  sudo yum install -y git
 else
   err "No package manager (dnf/yum) found. Install git manually."
 fi
 
 # ------------------ 2) Fix ownership & git safe.directory ------------------
 log "Ensuring ${CLONE_PARENT} ownership and Git safe.directory"
-mkdir -p "${CLONE_PARENT}"
-chown -R "${EC2_USER}:${EC2_USER}" "${CLONE_PARENT}" || true
+sudo mkdir -p "${CLONE_PARENT}"
+sudo chown -R "${EC2_USER}:${EC2_USER}" "${CLONE_PARENT}" || true
 # add safe.directory for repo path (will quietly set even if repo missing)
 sudo -u "${EC2_USER}" git config --global --add safe.directory "${REPO_PATH}" || true
 
@@ -177,7 +177,7 @@ if [[ -d "${API_DIR}" ]]; then
   ENV_FILE="${API_DIR}/.env"
   log "Writing .env to ${ENV_FILE} (backup if exists)"
   if [[ -f "${ENV_FILE}" ]]; then
-    cp -a "${ENV_FILE}" "${ENV_FILE}.bak.$(date +%s)"
+    sudo cp -a "${ENV_FILE}" "${ENV_FILE}.bak.$(date +%s)"
   fi
   sudo -u "${EC2_USER}" bash -lc "cat > '${ENV_FILE}' <<'EOF'
 DB_HOST=${APP_DB_HOST}
@@ -187,8 +187,8 @@ DB_NAME=${APP_DB_NAME}
 JWT_SECRET=${JWT_SECRET}
 PORT=${APP_PORT}
 EOF"
-  chown "${EC2_USER}:${EC2_USER}" "${ENV_FILE}"
-  chmod 600 "${ENV_FILE}"
+  sudo chown "${EC2_USER}:${EC2_USER}" "${ENV_FILE}"
+  sudo chmod 600 "${ENV_FILE}"
 else
   log "API dir ${API_DIR} not found; skipping .env creation."
 fi
