@@ -8,7 +8,7 @@ DB_NAME="crud_app"
 JWT_SECRET="sapsecopsSuperSecretKey"
 
 git_url="https://github.com/sapsecops/3_Tier_Nodejs_App.git"
-APP_PATH="/home/ec2-user/"
+APP_PATH="/opt"
 APP_DIR="$APP_PATH/3_Tier_Nodejs_App"
 Branch_Name="01-Local-setup"
 
@@ -35,7 +35,7 @@ git checkout $Branch_Name
 echo "===== Setting Ownership ====="
 sudo chown -R ec2-user:ec2-user $APP_DIR
 
-cd api
+cd $APP_DIR/api
 
 echo "===== Installing MySQL Client ====="
 sudo yum update -y
